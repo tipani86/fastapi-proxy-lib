@@ -42,6 +42,48 @@ logger.add(
     level=os.environ.get("LOGURU_LEVEL", "INFO").strip().upper() or "INFO",
 )
 
+# ---- Header hygiene ----
+# These headers commonly carry "client chain" data across proxy hops and can cause
+# upstream services (e.g. httpbin) to report multi-IP "origin" lists.
+_STRIP_PROXY_CHAIN_HEADERS = (
+    "x-forwarded-for",
+    "forwarded",
+    "via",
+    "x-real-ip",
+    # Optional/common variants (kept for robustness; stripping is limited to /p route only)
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-client-ip",
+)
+
+
+def _clone_request_without_headers(
+    request: Request, *, strip_headers: tuple[str, ...]
+) -> tuple[Request, list[str]]:
+    """Clone request with filtered scope['headers'] while preserving the ASGI receive callable."""
+    strip_set = {h.encode("ascii") for h in strip_headers}
+
+    scope = dict(request.scope)
+    original_headers: list[tuple[bytes, bytes]] = list(scope.get("headers") or [])
+
+    removed: list[str] = []
+    filtered_headers: list[tuple[bytes, bytes]] = []
+    for k, v in original_headers:
+        lk = k.lower()
+        if lk in strip_set:
+            removed.append(lk.decode("ascii", errors="ignore"))
+            continue
+        filtered_headers.append((k, v))
+
+    scope["headers"] = filtered_headers
+
+    # Preserve the original ASGI receive callable so streaming bodies keep working.
+    receive = getattr(request, "_receive", None)
+    if receive is None:
+        receive = request.receive  # type: ignore[assignment]
+
+    return Request(scope, receive), removed
+
 
 def _env_bool(name: str, default: bool) -> bool:
     v = os.environ.get(name)
@@ -374,6 +416,24 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
         getattr(request.client, "host", None),
         _present_chain,
     )
+
+    filtered_request, removed_chain = _clone_request_without_headers(
+        request, strip_headers=_STRIP_PROXY_CHAIN_HEADERS
+    )
+    if removed_chain:
+        logger.debug(
+            "forward_proxied stripped chain headers: removed={}",
+            sorted(set(removed_chain)),
+        )
+        _present_after = {
+            h: filtered_request.headers.get(h)
+            for h in _chain_headers
+            if filtered_request.headers.get(h)
+        }
+        logger.debug(
+            "forward_proxied chain headers after strip: {}",
+            _present_after,
+        )
     if PROXY_LIST_URL is None:
         return JSONResponse(
             {"detail": "PROXY_LIST_URL is not configured."}, status_code=503
@@ -422,7 +482,7 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
                 follow_redirects=FOLLOW_REDIRECTS,
             )
             resp = await temp_forward_proxy.send_request_to_target(
-                request=request, target_url=target_url
+                request=filtered_request, target_url=target_url
             )
 
             # Special-case: proxy authentication required is clearly upstream-proxy related.
