@@ -1,0 +1,3 @@
+python-dotenv
+uvicorn
+fastapi-proxy-lib[standard]

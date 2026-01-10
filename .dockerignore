@@ -1,0 +1,23 @@
+.git
+.gitignore
+
+.venv
+.venv-docs
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+htmlcov
+.coverage
+coverage.xml
+
+docs
+docs_src
+site
+
+terminals
+
+# Do not bake env secrets into the image build context
+.env
+
