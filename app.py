@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import logging
 import os
 import random
+import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -23,6 +23,7 @@ from typing import Optional
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from loguru import logger
 from starlette.background import BackgroundTask, BackgroundTasks
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response as StarletteResponse
@@ -30,10 +31,16 @@ from starlette.responses import JSONResponse, Response as StarletteResponse
 from fastapi_proxy_lib.core.http import ForwardHttpProxy
 from fastapi_proxy_lib.core.tool import default_proxy_filter
 
-_logger = logging.getLogger(__name__)
-
 # Load `.env` early so module-level config reads see the values.
 load_dotenv(override=False)
+
+# ---- Logging (loguru) ----
+# Configure at import-time; control verbosity via env var LOGURU_LEVEL.
+logger.remove()
+logger.add(
+    sys.stderr,
+    level=os.environ.get("LOGURU_LEVEL", "INFO").strip().upper() or "INFO",
+)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -139,8 +146,8 @@ class ProxyPool:
             self.proxies = parsed
             self.last_refresh_ts = time.time()
 
-        _logger.info(
-            "proxy-pool refresh ok: count=%s elapsed_ms=%.2f",
+        logger.info(
+            "proxy-pool refresh ok: count={} elapsed_ms={:.2f}",
             len(parsed),
             (time.monotonic() - started) * 1000.0,
         )
@@ -188,10 +195,10 @@ class ProxyPoolRefresher:
                             fetch_client=self.fetch_client,
                             url=self.url,
                         )
-                        _logger.info("proxy-pool refreshed: reason=%s", reason)
+                        logger.info("proxy-pool refreshed: reason={}", reason)
                         return True
                     except Exception:
-                        _logger.exception("proxy-pool refresh failed: reason=%s", reason)
+                        logger.exception("proxy-pool refresh failed: reason={}", reason)
                         return False
 
                 task = asyncio.create_task(_do_refresh())
@@ -283,6 +290,13 @@ def _attach_close_client_background(
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    logger.debug(
+        "lifespan startup: PROXY_LIST_URL={} PROXY_REFRESH_INTERVAL_SECONDS={} PROXIED_RETRY_N={} FOLLOW_REDIRECTS={}",
+        PROXY_LIST_URL,
+        PROXY_REFRESH_INTERVAL_SECONDS,
+        PROXIED_RETRY_N,
+        FOLLOW_REDIRECTS,
+    )
     pool = ProxyPool()
 
     unproxied_client = httpx.AsyncClient()
@@ -297,6 +311,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     proxy_refresher: Optional[ProxyPoolRefresher] = None
 
     if PROXY_LIST_URL is not None:
+        logger.debug(
+            "proxy refresher enabled: url={} interval_seconds={}",
+            PROXY_LIST_URL,
+            PROXY_REFRESH_INTERVAL_SECONDS,
+        )
         proxy_refresher = ProxyPoolRefresher(
             pool=pool,
             fetch_client=refresh_client,
@@ -304,8 +323,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             interval_seconds=PROXY_REFRESH_INTERVAL_SECONDS,
             deadline_monotonic=time.monotonic(),
         )
-        await proxy_refresher.refresh_now(reason="startup")
+        ok = await proxy_refresher.refresh_now(reason="startup")
+        logger.debug("proxy refresher startup refresh: ok={}", ok)
         refresh_task = asyncio.create_task(proxy_refresher.refresh_loop())
+    else:
+        logger.debug("proxy refresher disabled: PROXY_LIST_URL is not configured")
 
     app.state.proxy_pool = pool
     app.state.proxy_refresher = proxy_refresher
@@ -314,6 +336,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        logger.debug("lifespan shutdown: starting cleanup")
         if refresh_task is not None:
             refresh_task.cancel()
             try:
@@ -322,6 +345,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 pass
         await refresh_client.aclose()
         await unproxied_forward_proxy.aclose()
+        logger.debug("lifespan shutdown: cleanup complete")
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -334,6 +358,22 @@ _ALL_HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH",
 @app.api_route("/p/{path:path}", methods=_ALL_HTTP_METHODS)
 async def forward_proxied(request: Request, path: str = "") -> StarletteResponse:
     """Forward proxy with per-request upstream proxy rotation and retry."""
+    _chain_headers = (
+        "x-forwarded-for",
+        "forwarded",
+        "via",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+    )
+    _present_chain = {h: request.headers.get(h) for h in _chain_headers if request.headers.get(h)}
+    logger.debug(
+        "forward_proxied entry: method={} incoming_url={} client={} chain_headers={}",
+        request.method,
+        str(request.url),
+        getattr(request.client, "host", None),
+        _present_chain,
+    )
     if PROXY_LIST_URL is None:
         return JSONResponse(
             {"detail": "PROXY_LIST_URL is not configured."}, status_code=503
@@ -346,6 +386,12 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
         target_url = httpx.URL(path)
     except httpx.InvalidURL:
         return JSONResponse({"detail": "Invalid target url."}, status_code=400)
+    logger.debug(
+        "forward_proxied parsed target_url: scheme={} host={} path={}",
+        target_url.scheme,
+        target_url.host,
+        target_url.path,
+    )
 
     # Apply default proxy filter (reject localhost/non-public IP, etc.).
     filter_result = default_proxy_filter(target_url)
@@ -357,12 +403,15 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
 
     last_exc: Optional[BaseException] = None
     for _attempt in range(max(PROXIED_RETRY_N, 1)):
+        logger.debug("forward_proxied attempt: {}", _attempt + 1)
         upstream = await pool.get_random()
         if upstream is None:
+            logger.debug("proxy pool empty; forcing refresh")
             await refresher.refresh_now(reason="empty_pool")
             upstream = await pool.get_random()
             if upstream is None:
                 return JSONResponse({"detail": "Proxy pool is empty."}, status_code=503)
+        logger.debug("selected upstream proxy: {}", upstream)
 
         temp_client: Optional[httpx.AsyncClient] = None
         try:
@@ -379,8 +428,8 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
             # Special-case: proxy authentication required is clearly upstream-proxy related.
             if getattr(resp, "status_code", None) == 407:
                 removed = await pool.remove(upstream)
-                _logger.warning(
-                    "removed upstream proxy due to 407: proxy=%s removed=%s",
+                logger.warning(
+                    "removed upstream proxy due to 407: proxy={} removed={}",
                     upstream,
                     removed,
                 )
@@ -393,13 +442,19 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
             return _attach_close_client_background(resp=resp, client=temp_client)
         except Exception as exc:
             last_exc = exc
+            logger.debug(
+                "forward_proxied exception: upstream={} exc_type={} exc={}",
+                upstream,
+                type(exc).__name__,
+                str(exc),
+            )
             if temp_client is not None:
                 await temp_client.aclose()
                 temp_client = None
             if _is_clear_upstream_proxy_error(exc):
                 removed = await pool.remove(upstream)
-                _logger.warning(
-                    "removed upstream proxy due to error: proxy=%s exc=%s removed=%s",
+                logger.warning(
+                    "removed upstream proxy due to error: proxy={} exc={} removed={}",
                     upstream,
                     type(exc).__name__,
                     removed,
@@ -427,5 +482,21 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
 @app.api_route("/{path:path}", methods=_ALL_HTTP_METHODS)
 async def forward_unproxied(request: Request, path: str = "") -> StarletteResponse:
     """Forward proxy without an upstream proxy."""
+    _chain_headers = (
+        "x-forwarded-for",
+        "forwarded",
+        "via",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+    )
+    _present_chain = {h: request.headers.get(h) for h in _chain_headers if request.headers.get(h)}
+    logger.debug(
+        "forward_unproxied entry: method={} incoming_url={} client={} chain_headers={}",
+        request.method,
+        str(request.url),
+        getattr(request.client, "host", None),
+        _present_chain,
+    )
     proxy: ForwardHttpProxy = app.state.unproxied_forward_proxy
     return await proxy.proxy(request=request, path=path)
