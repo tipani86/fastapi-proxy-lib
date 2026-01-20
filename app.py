@@ -51,6 +51,7 @@ _STRIP_PROXY_CHAIN_HEADERS = (
     "via",
     "x-real-ip",
     # Optional/common variants (kept for robustness; stripping is limited to /p route only)
+    "accept-encoding",
     "cf-connecting-ip",
     "cf-ipcountry",
     "cf-ray",
