@@ -52,6 +52,11 @@ _STRIP_PROXY_CHAIN_HEADERS = (
     "x-real-ip",
     # Optional/common variants (kept for robustness; stripping is limited to /p route only)
     "cf-connecting-ip",
+    "cf-ipcountry",
+    "cf-ray",
+    "cf-visitor",
+    "cdn-loop",
+    "cookie",
     "true-client-ip",
     "x-client-ip",
 )
