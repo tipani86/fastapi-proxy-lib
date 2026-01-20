@@ -13,6 +13,7 @@ import asyncio
 import ipaddress
 import os
 import random
+import re
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -115,39 +116,63 @@ UPSTREAM_PROXY_READ_TIMEOUT: float = float(
 
 
 def _parse_ip_port(line: str) -> Optional[str]:
-    """Parse a single proxy endpoint line into canonical 'ip:port' (IPv6 must be bracketed).
+    """Parse a single proxy endpoint line into canonical 'host:port' (IPv6 must be bracketed).
 
     Accepted inputs:
     - '1.2.3.4:8080'
     - '[2001:db8::1]:8080'
+    - 'user:pass@1.2.3.4:8080'
+    - 'user:pass@brd.superproxy.io:33335'
     """
     s = line.strip()
     if not s or s.startswith("#"):
         return None
 
+    username: Optional[str] = None
+    password: Optional[str] = None
+    hostport = s
+    if "@" in s:
+        userinfo, hostport = s.rsplit("@", 1)
+        if ":" not in userinfo:
+            return None
+        username, password = userinfo.split(":", 1)
+        if not username or not password:
+            return None
+
     host: str
     port_str: str
+    is_bracketed_ipv6 = hostport.startswith("[")
 
-    if s.startswith("["):
+    if is_bracketed_ipv6:
         # Bracketed IPv6: [addr]:port
-        rb = s.find("]")
+        rb = hostport.find("]")
         if rb <= 1:
             return None
-        host = s[1:rb]
-        rest = s[rb + 1 :]
+        host = hostport[1:rb]
+        rest = hostport[rb + 1 :]
         if not rest.startswith(":"):
             return None
         port_str = rest[1:]
-    else:
-        # IPv4:port
-        if s.count(":") != 1:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
             return None
-        host, port_str = s.split(":", 1)
-
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        return None
+    else:
+        # IPv4/hostname:port
+        if ":" not in hostport:
+            return None
+        host, port_str = hostport.rsplit(":", 1)
+        if not host:
+            return None
+        if ":" in host:
+            return None
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+                return None
+            if host.startswith(".") or host.endswith(".") or ".." in host:
+                return None
 
     try:
         port = int(port_str)
@@ -157,9 +182,20 @@ def _parse_ip_port(line: str) -> Optional[str]:
         return None
 
     # Canonicalize output
-    if ":" in host:
-        return f"[{host}]:{port}"
-    return f"{host}:{port}"
+    host_out = f"[{host}]" if is_bracketed_ipv6 else host
+    if username is not None and password is not None:
+        return f"{username}:{password}@{host_out}:{port}"
+    return f"{host_out}:{port}"
+
+
+def _redact_proxy_creds(proxy: str) -> str:
+    """Mask user:pass@ in proxy strings for logging."""
+    if "@" not in proxy:
+        return proxy
+    userinfo, rest = proxy.rsplit("@", 1)
+    if ":" not in userinfo:
+        return proxy
+    return f"***:***@{rest}"
 
 
 @dataclass
@@ -477,7 +513,7 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
             upstream = await pool.get_random()
             if upstream is None:
                 return JSONResponse({"detail": "Proxy pool is empty."}, status_code=503)
-        logger.debug("selected upstream proxy: {}", upstream)
+        logger.debug("selected upstream proxy: {}", _redact_proxy_creds(upstream))
 
         temp_client: Optional[httpx.AsyncClient] = None
         try:
