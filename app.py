@@ -346,11 +346,12 @@ def _make_proxied_async_client(*, proxy: str) -> httpx.AsyncClient:
         # Older httpx API (documented in this repo) supports `proxies=...`.
         return httpx.AsyncClient(
             proxies={"http://": proxy_url, "https://": proxy_url},
+            verify=False,
             timeout=timeout,
         )
     except TypeError:
         # Newer httpx API uses `proxy=...` (best-effort compatibility).
-        return httpx.AsyncClient(proxy=proxy_url, timeout=timeout)
+        return httpx.AsyncClient(proxy=proxy_url, verify=False, timeout=timeout)
 
 
 def _attach_close_client_background(
