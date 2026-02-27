@@ -452,6 +452,10 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
         "true-client-ip",
     )
     _present_chain = {h: request.headers.get(h) for h in _chain_headers if request.headers.get(h)}
+    _chain_header_set = set(_chain_headers)
+    _non_chain_headers = {
+        k: v for k, v in request.headers.items() if k.lower() not in _chain_header_set
+    }
     logger.debug(
         "forward_proxied entry: method={} incoming_url={} client={} chain_headers={}",
         request.method,
@@ -459,6 +463,7 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
         getattr(request.client, "host", None),
         _present_chain,
     )
+    logger.debug("forward_proxied non_chain_headers={}", _non_chain_headers)
 
     filtered_request, removed_chain = _clone_request_without_headers(
         request, strip_headers=_STRIP_PROXY_CHAIN_HEADERS
@@ -594,6 +599,10 @@ async def forward_unproxied(request: Request, path: str = "") -> StarletteRespon
         "true-client-ip",
     )
     _present_chain = {h: request.headers.get(h) for h in _chain_headers if request.headers.get(h)}
+    _chain_header_set = set(_chain_headers)
+    _non_chain_headers = {
+        k: v for k, v in request.headers.items() if k.lower() not in _chain_header_set
+    }
     logger.debug(
         "forward_unproxied entry: method={} incoming_url={} client={} chain_headers={}",
         request.method,
@@ -601,5 +610,6 @@ async def forward_unproxied(request: Request, path: str = "") -> StarletteRespon
         getattr(request.client, "host", None),
         _present_chain,
     )
+    logger.debug("forward_unproxied non_chain_headers={}", _non_chain_headers)
     proxy: ForwardHttpProxy = app.state.unproxied_forward_proxy
     return await proxy.proxy(request=request, path=path)
