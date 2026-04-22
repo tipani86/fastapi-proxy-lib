@@ -7,7 +7,8 @@ WORKDIR /app
 
 # Install runtime deps
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -U pip && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl wget && \
+    pip install --no-cache-dir -U pip && \
     pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy application code
