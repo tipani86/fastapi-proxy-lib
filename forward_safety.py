@@ -244,6 +244,78 @@ class _TunnelTLSBackend(httpcore.AsyncNetworkBackend):
         await self.backend.sleep(seconds)
 
 
+class _PlainTunnelBackend(httpcore.AsyncNetworkBackend):
+    """Tunnel plain HTTP so a proxy cannot replace the logical Host authority.
+
+    Requires upstream CONNECT support on port 80; never fall back to unsafe
+    numeric absolute-form forwarding if the upstream refuses the tunnel.
+    """
+
+    def __init__(self, backend: httpcore.AsyncNetworkBackend, proxy: str) -> None:
+        self.backend = backend
+        self.proxy = httpx.Proxy(proxy)
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        from httpcore._async.connection import AsyncHTTPConnection
+
+        proxy_url = self.proxy.url
+        connection = AsyncHTTPConnection(
+            origin=httpcore.Origin(
+                scheme=b"http",
+                host=proxy_url.raw_host,
+                port=proxy_url.port or 80,
+            ),
+            network_backend=self.backend,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+        authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        headers = [(b"Host", authority.encode("ascii"))]
+        if self.proxy.raw_auth is not None:
+            import base64
+
+            credentials = b":".join(self.proxy.raw_auth)
+            headers.append(
+                (b"Proxy-Authorization", b"Basic " + base64.b64encode(credentials))
+            )
+        try:
+            response = await connection.handle_async_request(
+                httpcore.Request(
+                    method=b"CONNECT",
+                    url=httpcore.URL(
+                        scheme=b"http",
+                        host=proxy_url.raw_host,
+                        port=proxy_url.port or 80,
+                        target=authority.encode("ascii"),
+                    ),
+                    headers=headers,
+                    extensions={
+                        "timeout": {
+                            "connect": timeout,
+                            "read": timeout,
+                            "write": timeout,
+                        }
+                    },
+                )
+            )
+            if not 200 <= response.status <= 299:
+                raise httpcore.ProxyError(f"{response.status} CONNECT refused")
+            return response.extensions["network_stream"]
+        except BaseException:
+            await connection.aclose()
+            raise
+
+    async def sleep(self, seconds: float) -> None:
+        await self.backend.sleep(seconds)
+
+
 class _ResponseStream(httpx.AsyncByteStream):
     """Keep a per-hop transport alive until its response stream closes."""
 
@@ -318,7 +390,7 @@ class PublicDestinationTransport(httpx.AsyncBaseTransport):
                     or (
                         isinstance(exc, httpx.ProxyError)
                         and not (
-                            target.scheme == "https"
+                            self.proxy is not None
                             and str(exc).split(" ", 1)[0] in {"502", "503", "504"}
                         )
                     )
@@ -340,14 +412,20 @@ class PublicDestinationTransport(httpx.AsyncBaseTransport):
             stream=request.stream,
             extensions=extensions,
         )
+        plain_tunnel = self.proxy is not None and target.scheme == "http"
         transport = httpx.AsyncHTTPTransport(
             verify=ssl.create_default_context(),
             trust_env=False,
-            proxy=self.proxy,
+            proxy=None if plain_tunnel else self.proxy,
             retries=0,
             limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
         )
-        if self.proxy is not None:
+        if plain_tunnel:
+            assert self.proxy is not None
+            transport._pool._network_backend = _PlainTunnelBackend(
+                transport._pool._network_backend, self.proxy
+            )
+        elif self.proxy is not None:
             # Version-pinned private seam: AsyncHTTPTransport has no backend argument.
             # CONNECT still uses the numeric URL; only TLS name verification changes.
             transport._pool._network_backend = _TunnelTLSBackend(

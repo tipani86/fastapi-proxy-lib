@@ -212,10 +212,22 @@ async def test_real_verified_tls_original_sni_numeric_socket_or_connect(
 async def test_real_http_numeric_request_target_body_host_and_user_agent(
     monkeypatch, proxied, address
 ):
-    received, dials = [], []
+    received, dials, connects = [], [], []
 
     async def serve(reader, writer):
         headers = await reader.readuntil(b"\r\n\r\n")
+        if headers.startswith(b"CONNECT "):
+            connects.append(headers)
+            writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            await writer.drain()
+            headers = await reader.readuntil(b"\r\n\r\n")
+        elif proxied:
+            # A compliant forward proxy regenerates Host from absolute authority.
+            authority = headers.split(b" ", 2)[1].split(b"/", 3)[2]
+            headers = b"\r\n".join(
+                b"Host: " + authority if line.lower().startswith(b"host:") else line
+                for line in headers.split(b"\r\n")
+            )
         body = await reader.readexactly(7)
         received.append((headers, body))
         writer.write(
@@ -262,11 +274,10 @@ async def test_real_http_numeric_request_target_body_host_and_user_agent(
     assert response.content == b"ok"
     assert dials == [("upstream.example.com", 8080) if proxied else (address, 80)]
     headers, body = received[0]
-    authority = f"[{address}]" if ":" in address else address
-    request_target = (
-        f"http://{authority}/doc?outer=kept" if proxied else "/doc?outer=kept"
-    )
-    assert headers.startswith(f"POST {request_target} HTTP/1.1\r\n".encode())
+    if proxied:
+        authority = f"[{address}]:80" if ":" in address else f"{address}:80"
+        assert connects[0].startswith(f"CONNECT {authority} HTTP/1.1\r\n".encode())
+    assert headers.startswith(b"POST /doc?outer=kept HTTP/1.1\r\n")
     assert b"host: public.example.com\r\n" in headers.lower()
     assert b"user-agent: PodPie/1.0\r\n" in headers
     assert body == b"payload"
@@ -319,3 +330,80 @@ async def test_real_tls_falls_back_without_resolving_again_or_replaying_body(
     else:
         assert dials == [("93.184.216.35", 443), ("2606:4700:4700::1111", 443)]
     assert not transport._active
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [200, 403, 407, 502])
+async def test_plain_http_connect_auth_failure_cleanup_and_address_fallback(
+    monkeypatch, status
+):
+    connects, origin_requests, resolutions = [], [], []
+    closed = asyncio.Queue()
+
+    async def serve(reader, writer):
+        try:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            connects.append(headers)
+            # Only the first address fails for a transient gateway error.
+            result = 200 if status == 502 and len(connects) > 1 else status
+            writer.write(f"HTTP/1.1 {result} Test\r\n\r\n".encode())
+            await writer.drain()
+            if result == 200:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                origin_requests.append(headers + await reader.readexactly(7))
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                await writer.drain()
+            closed.put_nowait(await reader.read())
+        finally:
+            await close_writer(writer)
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    original_dial = AnyIOBackend.connect_tcp
+
+    async def dial(self, host, port, **kwargs):
+        assert (host, port) == ("upstream.example.com", 8080)
+        return await original_dial(
+            self, host="127.0.0.1", port=server.sockets[0].getsockname()[1], **kwargs
+        )
+
+    async def resolve(host, port):
+        resolutions.append((host, port))
+        return ["93.184.216.34", "2606:4700:4700::1111"]
+
+    monkeypatch.setattr(AnyIOBackend, "connect_tcp", dial)
+    monkeypatch.setattr(safety, "_resolve", resolve)
+    transport = safety.PublicDestinationTransport(
+        proxy="http://unit:secret@upstream.example.com:8080"
+    )
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=2) as client:
+            if status in (403, 407):
+                with pytest.raises(httpx.ProxyError):
+                    await client.post(
+                        "http://public.example.com/doc", content=b"payload"
+                    )
+            else:
+                assert (
+                    await client.post(
+                        "http://public.example.com/doc", content=b"payload"
+                    )
+                ).content == b"ok"
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert await asyncio.wait_for(
+        asyncio.gather(*(closed.get() for _ in connects)), timeout=2
+    ) == [b""] * len(connects)
+    assert resolutions == [("public.example.com", 80)]
+    assert len(connects) == (2 if status == 502 else 1)
+    assert all(
+        b"Proxy-Authorization: Basic dW5pdDpzZWNyZXQ=\r\n" in item for item in connects
+    )
+    assert not transport._active
+    if status in (403, 407):
+        assert not origin_requests
+    else:
+        assert len(origin_requests) == 1
+        assert b"host: public.example.com\r\n" in origin_requests[0].lower()
+        assert b"proxy-authorization:" not in origin_requests[0].lower()
+        assert origin_requests[0].endswith(b"payload")

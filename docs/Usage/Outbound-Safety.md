@@ -49,9 +49,14 @@ response = httpx.get(
   retains the original origin. This runs after `ForwardHttpProxy` prepares headers.
   The logical HTTPX request URL is not mutated, so relative redirects, cross-origin
   header handling and query/method redirect semantics still use the original URL.
-- Direct sockets dial only the selected numeric address. Proxied HTTP uses a
-  numeric absolute-form request target; proxied HTTPS sends numeric `CONNECT`.
-  Public IPv4 and IPv6 targets are supported (IPv6 CONNECT authorities are bracketed).
+- Direct sockets dial only validated numeric addresses. Both proxied HTTP and
+  HTTPS use numeric `CONNECT`; plaintext HTTP then sends origin-form requests
+  with the original Host through the tunnel. This avoids compliant forward proxies
+  regenerating Host from a numeric absolute-form authority (RFC 9112 §3.2.2).
+  Upstreams must permit CONNECT on port **80** as well as 443; refusal fails closed,
+  with no unsafe absolute-form fallback. Public IPv4 and IPv6 are supported with
+  bracketed IPv6 CONNECT authorities. Pre-request connection/gateway failures can
+  try remaining validated addresses without a second DNS lookup or body replay.
 - TLS certificate chain **and original-hostname** verification are enabled for
   both routes. Direct HTTPS uses the `sni_hostname` extension. HTTPcore 1.0.9's
   CONNECT tunnel does **not** honor that extension: a per-hop network-stream adapter
@@ -102,7 +107,9 @@ validated origins and TLS names.
 The tests exercise both real app routes and real HTTPX/HTTPcore sockets/TLS through
 an in-process HTTP CONNECT relay (only TCP routing is redirected to test listeners).
 They cover matching trusted certificates, wrong-host/untrusted failures, numeric
-IPv4/IPv6 dials/CONNECT, original Host/SNI, HTTP absolute-form forwarding, POST body,
+IPv4/IPv6 dials/CONNECT, original Host/SNI, plaintext HTTP tunneled virtual-host
+routing (including a compliant absolute-form Host-regeneration regression), POST body,
+CONNECT authentication/refusal/cleanup and gateway address fallback,
 User-Agent/query preservation, private/mixed DNS rejection, rebinding/redirects,
 large streaming responses and failed-proxy removal/retry cleanup. No live external
 upstream proxy or production deployment is used by these tests.
