@@ -244,7 +244,7 @@ async def fetch_feed(url: str) -> Response:
     """Fetch over direct egress, returning only bytes, never upstream headers."""
     try:
         return await asyncio.wait_for(_fetch(url), timeout=TOTAL_TIMEOUT)
-    except (TimeoutError, httpx.TimeoutException):
+    except (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException):
         return _error(504, "Feed fetch timed out.")
     except InvalidDestinationError:
         return _error(400, "Invalid feed destination.")

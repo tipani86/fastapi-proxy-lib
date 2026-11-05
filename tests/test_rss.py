@@ -244,6 +244,24 @@ async def test_whole_request_deadline_covers_all_phases(outbound, monkeypatch, p
     assert time.monotonic() - start < 0.5
 
 
+@pytest.mark.anyio
+async def test_legacy_asyncio_deadline_returns_504(monkeypatch):
+    # Python 3.9/3.10 use a distinct exception, not built-in TimeoutError.
+    class LegacyAsyncioTimeoutError(Exception):
+        pass
+
+    async def expired_wait_for(awaitable, timeout):
+        assert timeout == rss_fetch.TOTAL_TIMEOUT
+        awaitable.close()
+        raise LegacyAsyncioTimeoutError
+
+    monkeypatch.setattr(asyncio, "TimeoutError", LegacyAsyncioTimeoutError)
+    monkeypatch.setattr(asyncio, "wait_for", expired_wait_for)
+    response = await rss_fetch.fetch_feed("https://feeds.example.com/rss")
+    assert response.status_code == 504
+    assert response.body == b'{"detail":"Feed fetch timed out."}'
+
+
 @pytest.mark.parametrize(
     "address", ["192.88.99.1", "2001:20::1", "2001:30::1", "3fff::1"]
 )
