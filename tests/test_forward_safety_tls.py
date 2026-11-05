@@ -76,7 +76,16 @@ async def wire_servers(tls_certificate):
 
     async def serve(reader, writer):
         try:
-            received.append(await reader.readuntil(b"\r\n\r\n"))
+            headers = await reader.readuntil(b"\r\n\r\n")
+            length = next(
+                (
+                    int(line.split(b":", 1)[1])
+                    for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                ),
+                0,
+            )
+            received.append(headers + await reader.readexactly(length))
             writer.write(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata"
             )
@@ -94,6 +103,11 @@ async def wire_servers(tls_certificate):
         tasks.add(task)
         try:
             connects.append(await reader.readuntil(b"\r\n\r\n"))
+            if connects[-1].startswith(b"CONNECT 93.184.216.35:443 "):
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                await close_writer(writer)
+                return
             upstream_reader, upstream_writer = await asyncio.open_connection(
                 "127.0.0.1", origin_port
             )
@@ -153,7 +167,7 @@ async def test_real_verified_tls_original_sni_numeric_socket_or_connect(
 
     async def resolve(host, port):
         assert (host, port) == (hostname, 443)
-        return [address]
+        return [address, "8.8.8.8"]
 
     monkeypatch.setattr(AnyIOBackend, "connect_tcp", dial)
     monkeypatch.setattr(safety, "_resolve", resolve)
@@ -164,7 +178,7 @@ async def test_real_verified_tls_original_sni_numeric_socket_or_connect(
     else:
         monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     monkeypatch.setattr(proxy_app, "PROXY_LIST_URL", None)
-    monkeypatch.setattr(proxy_app, "PROXIED_RETRY_N", 1)
+    monkeypatch.setattr(proxy_app, "PROXIED_RETRY_N", 3)
     async with proxy_app.app.router.lifespan_context(proxy_app.app):
         monkeypatch.setattr(
             proxy_app, "PROXY_LIST_URL", "https://operator.example.com/list"
@@ -178,6 +192,7 @@ async def test_real_verified_tls_original_sni_numeric_socket_or_connect(
             response = await client.get(
                 prefix + quote(f"https://{hostname}/document", safe="")
             )
+        assert proxy_app.app.state.proxy_pool.proxies == ["upstream.example.com:8080"]
     assert response.status_code == (200 if success else (502 if proxied else 500))
     assert dials == [("upstream.example.com", 8080) if proxied else (address, 443)]
     assert sni == [hostname]
@@ -193,8 +208,9 @@ async def test_real_verified_tls_original_sni_numeric_socket_or_connect(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("proxied", [False, True])
+@pytest.mark.parametrize("address", ["93.184.216.34", "2606:4700:4700::1111"])
 async def test_real_http_numeric_request_target_body_host_and_user_agent(
-    monkeypatch, proxied
+    monkeypatch, proxied, address
 ):
     received, dials = [], []
 
@@ -218,7 +234,7 @@ async def test_real_http_numeric_request_target_body_host_and_user_agent(
 
     async def resolve(host, port):
         assert (host, port) == ("public.example.com", 80)
-        return ["93.184.216.34"]
+        return [address]
 
     monkeypatch.setattr(AnyIOBackend, "connect_tcp", dial)
     monkeypatch.setattr(safety, "_resolve", resolve)
@@ -244,14 +260,62 @@ async def test_real_http_numeric_request_target_body_host_and_user_agent(
         server.close()
         await server.wait_closed()
     assert response.content == b"ok"
-    assert dials == [
-        ("upstream.example.com", 8080) if proxied else ("93.184.216.34", 80)
-    ]
+    assert dials == [("upstream.example.com", 8080) if proxied else (address, 80)]
     headers, body = received[0]
+    authority = f"[{address}]" if ":" in address else address
     request_target = (
-        "http://93.184.216.34/doc?outer=kept" if proxied else "/doc?outer=kept"
+        f"http://{authority}/doc?outer=kept" if proxied else "/doc?outer=kept"
     )
     assert headers.startswith(f"POST {request_target} HTTP/1.1\r\n".encode())
     assert b"host: public.example.com\r\n" in headers.lower()
     assert b"user-agent: PodPie/1.0\r\n" in headers
     assert body == b"payload"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("proxied", [False, True])
+async def test_real_tls_falls_back_without_resolving_again_or_replaying_body(
+    monkeypatch, tls_certificate, wire_servers, proxied
+):
+    origin_port, proxy_port, sni, connects, received = wire_servers
+    original_dial = AnyIOBackend.connect_tcp
+    resolutions, dials = [], []
+
+    async def resolve(host, port):
+        resolutions.append((host, port))
+        return ["93.184.216.35", "2606:4700:4700::1111"]
+
+    async def dial(self, host, port, **kwargs):
+        dials.append((host, port))
+        if not proxied and host == "93.184.216.35":
+            raise httpx.ConnectError("first validated address unavailable")
+        return await original_dial(
+            self,
+            host="127.0.0.1",
+            port=proxy_port if proxied else origin_port,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(AnyIOBackend, "connect_tcp", dial)
+    monkeypatch.setattr(safety, "_resolve", resolve)
+    monkeypatch.setenv("SSL_CERT_FILE", str(tls_certificate[0]))
+    transport = safety.PublicDestinationTransport(
+        proxy="http://upstream.example.com:8080" if proxied else None
+    )
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+        response = await client.post(
+            "https://public.example.com/document", content=b"payload"
+        )
+    assert response.content == b"data"
+    assert resolutions == [("public.example.com", 443)]
+    assert len(dials) == 2
+    assert sni == ["public.example.com"]
+    assert len(received) == 1
+    assert received[0].startswith(b"POST /document HTTP/1.1\r\n")
+    assert received[0].endswith(b"\r\n\r\npayload")
+    if proxied:
+        assert connects[0].startswith(b"CONNECT 93.184.216.35:443 ")
+        assert connects[1].startswith(b"CONNECT [2606:4700:4700::1111]:443 ")
+    else:
+        assert dials == [("93.184.216.35", 443), ("2606:4700:4700::1111", 443)]
+    assert not transport._active

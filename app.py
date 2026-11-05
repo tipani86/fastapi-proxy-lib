@@ -36,6 +36,7 @@ from forward_safety import (
     InvalidDestinationError,
     PublicDestinationTransport,
     destination_url,
+    is_origin_certificate_error,
 )
 
 # Load `.env` early so module-level config reads see the values.
@@ -327,6 +328,8 @@ class ProxyPoolRefresher:
 
 def _is_clear_upstream_proxy_error(exc: BaseException) -> bool:
     """Classifier for delete-worthy upstream proxy failures (exception-based)."""
+    if is_origin_certificate_error(exc):
+        return False
     return isinstance(
         exc,
         (
@@ -582,7 +585,14 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
 
     # Retries exhausted or non-clear failure encountered.
     if last_exc is not None:
-        status_code = 502 if _is_clear_upstream_proxy_error(last_exc) else 500
+        status_code = (
+            502
+            if (
+                _is_clear_upstream_proxy_error(last_exc)
+                or is_origin_certificate_error(last_exc)
+            )
+            else 500
+        )
         return JSONResponse(
             {
                 "detail": "Proxy request failed.",

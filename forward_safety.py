@@ -33,6 +33,18 @@ _SPECIAL_NETWORKS = tuple(
 )
 
 
+def is_origin_certificate_error(exc: BaseException) -> bool:
+    """Identify verified-origin TLS failures through HTTPX/httpcore wrappers."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class InvalidDestinationError(ValueError):
     """Destination failed the public outbound policy."""
 
@@ -119,7 +131,7 @@ async def _resolve(host: str, port: int) -> list[str]:
     return [answer[4][0] for answer in answers]
 
 
-async def _pinned_ip(url: httpx.URL) -> str:
+async def _pinned_addresses(url: httpx.URL) -> list[str]:
     try:
         ipaddress.ip_address(url.host)
     except ValueError:
@@ -135,7 +147,7 @@ async def _pinned_ip(url: httpx.URL) -> str:
         validated = [_public_ip(address) for address in addresses]
     except ValueError:
         raise InvalidDestinationError from None
-    return validated[0]
+    return list(dict.fromkeys(validated))
 
 
 class _TunnelTLSStream(httpcore.AsyncNetworkStream):
@@ -152,22 +164,35 @@ class _TunnelTLSStream(httpcore.AsyncNetworkStream):
         self.stream = stream
         self.hostname = hostname
         self.address = address
+        self._headers_written = False
 
     async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         return await self.stream.read(max_bytes, timeout=timeout)
 
     async def write(self, buffer: bytes, timeout: float | None = None) -> None:
-        # HTTPcore 1.0.9 emits an unbracketed IPv6 CONNECT authority. h11 sends
-        # this header block in one write; fix only the exact pinned authority.
-        bare = f"{self.address}:443".encode("ascii")
-        bracketed = f"[{self.address}]:443".encode("ascii")
-        if ":" in self.address and buffer.startswith(
-            b"CONNECT " + bare + b" HTTP/1.1\r\n"
-        ):
-            buffer = buffer.replace(b"CONNECT " + bare, b"CONNECT " + bracketed, 1)
-            buffer = buffer.replace(
-                b"\r\nHost: " + bare + b"\r\n", b"\r\nHost: " + bracketed + b"\r\n", 1
-            )
+        # HTTPcore 1.0.9 omits IPv6 brackets in CONNECT and absolute-form URLs.
+        # h11 writes headers in one block; never rewrite subsequent body writes.
+        if not self._headers_written and ":" in self.address:
+            bare = f"{self.address}:443".encode("ascii")
+            bracketed = f"[{self.address}]:443".encode("ascii")
+            if buffer.startswith(b"CONNECT " + bare + b" HTTP/1.1\r\n"):
+                buffer = buffer.replace(b"CONNECT " + bare, b"CONNECT " + bracketed, 1)
+                buffer = buffer.replace(
+                    b"\r\nHost: " + bare + b"\r\n",
+                    b"\r\nHost: " + bracketed + b"\r\n",
+                    1,
+                )
+            else:
+                method, separator, rest = buffer.partition(b" ")
+                prefix = f"http://{self.address}/".encode("ascii")
+                if rest.startswith(prefix):
+                    buffer = (
+                        method
+                        + separator
+                        + f"http://[{self.address}]/".encode("ascii")
+                        + rest[len(prefix) :]
+                    )
+        self._headers_written = True
         await self.stream.write(buffer, timeout=timeout)
 
     async def aclose(self) -> None:
@@ -279,7 +304,31 @@ class PublicDestinationTransport(httpx.AsyncBaseTransport):
             raise InvalidDestinationError("HTTPS downgrade is forbidden.")
         request.extensions["public_destination_https"] = target.scheme == "https"
         timeout = request.extensions.get("timeout", {}).get("connect", 5.0)
-        address = await asyncio.wait_for(_pinned_ip(target), timeout=timeout)
+        addresses = await asyncio.wait_for(_pinned_addresses(target), timeout=timeout)
+        for index, address in enumerate(addresses):
+            try:
+                return await self._handle_pinned(request, target, address)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as exc:
+                # These errors precede origin request/body transmission. Only a
+                # CONNECT gateway failure is eligible among proxy errors; never
+                # retry authentication failures or origin certificate failures.
+                if (
+                    index == len(addresses) - 1
+                    or is_origin_certificate_error(exc)
+                    or (
+                        isinstance(exc, httpx.ProxyError)
+                        and not (
+                            target.scheme == "https"
+                            and str(exc).split(" ", 1)[0] in {"502", "503", "504"}
+                        )
+                    )
+                ):
+                    raise
+        raise AssertionError("validated address list cannot be empty")
+
+    async def _handle_pinned(
+        self, request: httpx.Request, target: httpx.URL, address: str
+    ) -> httpx.Response:
         hostname = target.raw_host.decode("ascii")
         headers = request.headers.copy()
         headers["host"] = target.netloc.decode("ascii")
