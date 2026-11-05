@@ -2,6 +2,6 @@ python-dotenv
 uvicorn
 fastapi-proxy-lib[standard]
 loguru
-# The RSS fetcher's DNS-pin/SNI contract is exercised against these versions.
+# Shared direct/proxied DNS pinning and CONNECT/TLS seams are tested on these versions.
 httpx==0.28.1
 httpcore==1.0.9
