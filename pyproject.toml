@@ -96,9 +96,9 @@ dependencies = [
     "pytest == 7.*",
     "pytest-cov ==  4.*",
     "uvicorn[standard] < 1.0.0", # TODO: Once it releases version 1.0.0, we will remove this restriction.
-    "httpx[http2]==0.28.1",        # Match the deployed RSS transport's SNI/pinning contract.
+    "httpx[http2]==0.28.1",        # Match the deployed shared destination-safety transport.
     "httpcore==1.0.9",
-    "python-dotenv",               # Standalone app.py is imported by RSS endpoint tests.
+    "python-dotenv",               # Standalone app.py is imported by forwarding tests.
     "loguru",
     "anyio",                     # we don't set version here, because fastapi has a dependency on it
     "asgi-lifespan==2.*",

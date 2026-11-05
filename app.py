@@ -1,10 +1,7 @@
-"""Runnable FastAPI app with ordinary, rotating and bounded-feed forward routes.
-
-- /rss?url=<public HTTP(S) feed URL>:
-    DNS-pinned direct feed fetching, independently bounded and validated.
+"""Runnable FastAPI app with shared public-destination safety on both routes.
 
 - /{path:path}:
-    Direct forward proxy (no upstream proxy), uses a long-lived httpx.AsyncClient.
+    Direct forward proxy (no upstream proxy), with per-hop pinned transports.
 - /p/{path:path}:
     Forward proxy with per-request upstream HTTP proxy rotation, backed by a global pool
     refreshed periodically from a URL.
@@ -35,7 +32,11 @@ from starlette.responses import Response as StarletteResponse
 
 from fastapi_proxy_lib.core.http import ForwardHttpProxy
 from fastapi_proxy_lib.core.tool import default_proxy_filter
-from rss_fetch import fetch_feed
+from forward_safety import (
+    InvalidDestinationError,
+    PublicDestinationTransport,
+    destination_url,
+)
 
 # Load `.env` early so module-level config reads see the values.
 load_dotenv(override=False)
@@ -347,16 +348,11 @@ def _make_proxied_async_client(*, proxy: str) -> httpx.AsyncClient:
         pool=UPSTREAM_PROXY_CONNECT_TIMEOUT,
     )
     proxy_url = f"http://{proxy}"
-    try:
-        # Older httpx API (documented in this repo) supports `proxies=...`.
-        return httpx.AsyncClient(
-            proxies={"http://": proxy_url, "https://": proxy_url},
-            verify=False,
-            timeout=timeout,
-        )
-    except TypeError:
-        # Newer httpx API uses `proxy=...` (best-effort compatibility).
-        return httpx.AsyncClient(proxy=proxy_url, verify=False, timeout=timeout)
+    return httpx.AsyncClient(
+        transport=PublicDestinationTransport(proxy=proxy_url, follow_redirects=FOLLOW_REDIRECTS),
+        trust_env=False,
+        timeout=timeout,
+    )
 
 
 def _attach_close_client_background(
@@ -389,7 +385,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     pool = ProxyPool()
 
-    unproxied_client = httpx.AsyncClient()
+    unproxied_client = httpx.AsyncClient(
+        transport=PublicDestinationTransport(follow_redirects=FOLLOW_REDIRECTS), trust_env=False
+    )
     unproxied_forward_proxy = ForwardHttpProxy(
         unproxied_client,
         proxy_filter=default_proxy_filter,
@@ -496,7 +494,9 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
     if not path:
         return JSONResponse({"detail": "Must provide target url."}, status_code=400)
     try:
-        target_url = httpx.URL(path)
+        target_url = destination_url(path)
+    except InvalidDestinationError:
+        return JSONResponse({"detail": "Invalid outbound destination."}, status_code=403)
     except httpx.InvalidURL:
         return JSONResponse({"detail": "Invalid target url."}, status_code=400)
     logger.debug(
@@ -553,6 +553,10 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
 
             # Important: response streams from the temp client; close it after response is sent.
             return _attach_close_client_background(resp=resp, client=temp_client)
+        except InvalidDestinationError:
+            if temp_client is not None:
+                await temp_client.aclose()
+            return JSONResponse({"detail": "Invalid outbound destination."}, status_code=403)
         except Exception as exc:
             last_exc = exc
             logger.debug(
@@ -592,12 +596,6 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
 
 
 
-@app.get("/rss")
-async def rss(url: str = "") -> StarletteResponse:
-    """Fetch a bounded public feed over DNS-pinned direct egress."""
-    return await fetch_feed(url)
-
-
 @app.api_route("/{path:path}", methods=_ALL_HTTP_METHODS)
 async def forward_unproxied(request: Request, path: str = "") -> StarletteResponse:
     """Forward proxy without an upstream proxy."""
@@ -623,4 +621,9 @@ async def forward_unproxied(request: Request, path: str = "") -> StarletteRespon
     )
     logger.debug("forward_unproxied non_chain_headers={}", _non_chain_headers)
     proxy: ForwardHttpProxy = app.state.unproxied_forward_proxy
-    return await proxy.proxy(request=request, path=path)
+    try:
+        if path:
+            destination_url(path)
+        return await proxy.proxy(request=request, path=path)
+    except InvalidDestinationError:
+        return JSONResponse({"detail": "Invalid outbound destination."}, status_code=403)
