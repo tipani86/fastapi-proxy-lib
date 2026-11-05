@@ -1,4 +1,7 @@
-"""Runnable FastAPI app that exposes two forward-proxy routes.
+"""Runnable FastAPI app with ordinary, rotating and bounded-feed forward routes.
+
+- /rss?url=<public HTTP(S) feed URL>:
+    DNS-pinned direct feed fetching, independently bounded and validated.
 
 - /{path:path}:
     Direct forward proxy (no upstream proxy), uses a long-lived httpx.AsyncClient.
@@ -27,10 +30,12 @@ from fastapi import FastAPI
 from loguru import logger
 from starlette.background import BackgroundTask, BackgroundTasks
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response as StarletteResponse
+from starlette.responses import JSONResponse
+from starlette.responses import Response as StarletteResponse
 
 from fastapi_proxy_lib.core.http import ForwardHttpProxy
 from fastapi_proxy_lib.core.tool import default_proxy_filter
+from rss_fetch import fetch_feed
 
 # Load `.env` early so module-level config reads see the values.
 load_dotenv(override=False)
@@ -585,6 +590,12 @@ async def forward_proxied(request: Request, path: str = "") -> StarletteResponse
 
     return JSONResponse({"detail": "Proxy request failed."}, status_code=502)
 
+
+
+@app.get("/rss")
+async def rss(url: str = "") -> StarletteResponse:
+    """Fetch a bounded public feed over DNS-pinned direct egress."""
+    return await fetch_feed(url)
 
 
 @app.api_route("/{path:path}", methods=_ALL_HTTP_METHODS)
