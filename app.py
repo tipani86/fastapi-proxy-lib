@@ -126,6 +126,12 @@ PROXY_REFRESH_INTERVAL_SECONDS: int = int(
 PROXIED_RETRY_N: int = int(os.environ.get("PROXIED_RETRY_N", "3"))
 FOLLOW_REDIRECTS: bool = _env_bool("FOLLOW_REDIRECTS", False)
 
+# Plain-route read/write and connect/pool budgets (seconds); optional overrides.
+UNPROXIED_READ_TIMEOUT: float = float(os.environ.get("UNPROXIED_READ_TIMEOUT", "60.0"))
+UNPROXIED_CONNECT_TIMEOUT: float = float(
+    os.environ.get("UNPROXIED_CONNECT_TIMEOUT", "10.0")
+)
+
 UPSTREAM_PROXY_CONNECT_TIMEOUT: float = float(
     os.environ.get("UPSTREAM_PROXY_CONNECT_TIMEOUT", "5.0")
 )
@@ -401,7 +407,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     pool = ProxyPool()
 
     unproxied_client = httpx.AsyncClient(
-        transport=PublicDestinationTransport(follow_redirects=FOLLOW_REDIRECTS), trust_env=False
+        transport=PublicDestinationTransport(follow_redirects=FOLLOW_REDIRECTS),
+        trust_env=False,
+        timeout=httpx.Timeout(
+            connect=UNPROXIED_CONNECT_TIMEOUT,
+            read=UNPROXIED_READ_TIMEOUT,
+            write=UNPROXIED_READ_TIMEOUT,
+            pool=UNPROXIED_CONNECT_TIMEOUT,
+        ),
     )
     unproxied_forward_proxy = ForwardHttpProxy(
         unproxied_client,
