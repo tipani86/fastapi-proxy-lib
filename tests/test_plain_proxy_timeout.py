@@ -52,10 +52,10 @@ async def test_plain_default_timeout_survives_build_stream_send_and_public_trans
 ):
     async with plain_client() as (inbound, outbound, seen):
         assert outbound.timeout.as_dict() == {
-            "connect": 10.0,
+            "connect": 60.0,
             "read": 60.0,
             "write": 60.0,
-            "pool": 10.0,
+            "pool": 60.0,
         }
         response = await inbound.post(
             "/" + quote("http://public.example.com/read", safe=""),

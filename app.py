@@ -129,7 +129,7 @@ FOLLOW_REDIRECTS: bool = _env_bool("FOLLOW_REDIRECTS", False)
 # Plain-route read/write and connect/pool budgets (seconds); optional overrides.
 UNPROXIED_READ_TIMEOUT: float = float(os.environ.get("UNPROXIED_READ_TIMEOUT", "60.0"))
 UNPROXIED_CONNECT_TIMEOUT: float = float(
-    os.environ.get("UNPROXIED_CONNECT_TIMEOUT", "10.0")
+    os.environ.get("UNPROXIED_CONNECT_TIMEOUT", "60.0")
 )
 
 UPSTREAM_PROXY_CONNECT_TIMEOUT: float = float(
