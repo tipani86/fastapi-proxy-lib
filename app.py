@@ -53,6 +53,18 @@ logger.add(
 # ---- Header hygiene ----
 # These headers commonly carry "client chain" data across proxy hops and can cause
 # upstream services (e.g. httpbin) to report multi-IP "origin" lists.
+# The plain route must not leak ingress/edge IP hints to origins that use
+# them for allowlisting. Keep authentication, cookies and body headers intact.
+_STRIP_CLIENT_IP_HEADERS = (
+    "x-forwarded-for",
+    "forwarded",
+    "via",
+    "x-real-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-client-ip",
+)
+
 _STRIP_PROXY_CHAIN_HEADERS = (
     "x-forwarded-for",
     "forwarded",
@@ -630,10 +642,13 @@ async def forward_unproxied(request: Request, path: str = "") -> StarletteRespon
         _present_chain,
     )
     logger.debug("forward_unproxied non_chain_headers={}", _non_chain_headers)
+    filtered_request, _ = _clone_request_without_headers(
+        request, strip_headers=_STRIP_CLIENT_IP_HEADERS
+    )
     proxy: ForwardHttpProxy = app.state.unproxied_forward_proxy
     try:
         if path:
             destination_url(path)
-        return await proxy.proxy(request=request, path=path)
+        return await proxy.proxy(request=filtered_request, path=path)
     except InvalidDestinationError:
         return JSONResponse({"detail": "Invalid outbound destination."}, status_code=403)

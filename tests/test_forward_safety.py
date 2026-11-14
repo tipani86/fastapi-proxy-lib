@@ -73,6 +73,55 @@ def endpoint(prefix, target):
 
 
 @pytest.mark.anyio
+async def test_source_ip_headers_are_stripped_without_altering_payload_or_auth(
+    forwarding, monkeypatch
+):
+    prefix, client, requests, _, replies, _ = forwarding
+    payloads = []
+    previous_handle = httpx.AsyncHTTPTransport.handle_async_request
+
+    async def handle(transport, outbound):
+        payloads.append(await outbound.aread())
+        return await previous_handle(transport, outbound)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
+    replies.append(httpx.Response(200, stream=Chunks([b"ok"])))
+    chain = (
+        "X-Forwarded-For",
+        "Forwarded",
+        "Via",
+        "X-Real-IP",
+        "CF-Connecting-IP",
+        "True-Client-IP",
+        "X-Client-IP",
+    )
+    headers = [(name, "192.0.2.10") for name in chain]
+    headers += [
+        ("x-forwarded-for", "192.0.2.11"),
+        ("Authorization", "Bearer synthetic-test-only"),
+        ("Cookie", "session=synthetic-test-only"),
+        ("Content-Type", "application/json"),
+        ("User-Agent", "CRM-read-test/1.0"),
+    ]
+    async with client() as inbound:
+        response = await inbound.post(
+            endpoint(prefix, "http://public.example.com/read"),
+            headers=headers,
+            content=b'{"read":"only"}',
+        )
+    assert response.status_code == 200
+    assert len(requests) == 1
+    assert payloads == [b'{"read":"only"}']
+    outbound = requests[0]
+    assert all(name.lower() not in outbound.headers for name in chain)
+    assert outbound.headers["authorization"] == "Bearer synthetic-test-only"
+    assert outbound.headers["content-type"] == "application/json"
+    assert outbound.headers["user-agent"] == "CRM-read-test/1.0"
+    if prefix == "/":
+        assert outbound.headers["cookie"] == "session=synthetic-test-only"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "answers",
     [
